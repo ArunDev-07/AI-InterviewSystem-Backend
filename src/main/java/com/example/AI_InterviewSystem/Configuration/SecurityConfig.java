@@ -53,6 +53,12 @@ public class SecurityConfig {
 
         http.authorizeHttpRequests(auth -> auth
                 .requestMatchers("/public/**").permitAll()
+                // AI APIs
+                .requestMatchers(
+                        "/api/chat",
+                        "/api/analyze-code",
+                        "/api/aptitude-questions"
+                ).permitAll()
                 .requestMatchers("/swagger-ui/**", "/v3/api-docs/**").permitAll()
                 .requestMatchers("/admin/**").hasRole("ADMIN")
                 .requestMatchers("/api/admin/**").hasRole("ADMIN")

@@ -1,33 +1,22 @@
 package com.example.AI_InterviewSystem.Service;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.*;
+import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.request.ChatRequest;
+import dev.langchain4j.model.chat.response.ChatResponse;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.HttpClientErrorException;
-import org.springframework.web.client.RestTemplate;
 
-import java.util.*;
+import java.util.List;
 
 @Service
 public class ChatService {
 
-    @Value("${groq.api.key}")
-    private String apiKey;
+    private final ChatModel chatModel;
 
-    @Value("${groq.api.url}")
-    private String apiUrl;
-
-    @Value("${groq.model}")
-    private String model;
-
-    private final RestTemplate restTemplate;
-    private final ObjectMapper objectMapper;
-
-    public ChatService(RestTemplate restTemplate, ObjectMapper objectMapper) {
-        this.restTemplate = restTemplate;
-        this.objectMapper = objectMapper;
+    public ChatService(ChatModel chatModel) {
+        this.chatModel = chatModel;
     }
 
     // Default Groq call
@@ -38,59 +27,36 @@ public class ChatService {
     // Controlled token Groq call
     private String callGroq(String systemPrompt, String userMessage, int maxTokens) {
 
-        if (apiKey == null || apiKey.isBlank()) {
-            throw new RuntimeException("Groq API key is missing");
+        if (systemPrompt == null || systemPrompt.isBlank()) {
+            throw new RuntimeException("System prompt is missing");
         }
 
-        if (apiUrl == null || apiUrl.isBlank()) {
-            throw new RuntimeException("Groq API URL is missing");
+        if (userMessage == null || userMessage.isBlank()) {
+            throw new RuntimeException("User message cannot be empty");
         }
-
-        if (model == null || model.isBlank()) {
-            throw new RuntimeException("Groq model is missing");
-        }
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        headers.setBearerAuth(apiKey);
-
-        List<Map<String, String>> messages = new ArrayList<>();
-        messages.add(Map.of("role", "system", "content", systemPrompt));
-        messages.add(Map.of("role", "user", "content", userMessage));
-
-        Map<String, Object> requestBody = new HashMap<>();
-        requestBody.put("model", model);
-        requestBody.put("messages", messages);
-        requestBody.put("temperature", 0.2);
-        requestBody.put("max_tokens", maxTokens);
-
-        HttpEntity<Map<String, Object>> request =
-                new HttpEntity<>(requestBody, headers);
 
         try {
-            ResponseEntity<String> response =
-                    restTemplate.postForEntity(apiUrl, request, String.class);
+            List<ChatMessage> messages = List.of(
+                    SystemMessage.from(systemPrompt),
+                    UserMessage.from(userMessage)
+            );
 
-            if (response.getBody() == null) {
+            ChatRequest request = ChatRequest.builder()
+                    .messages(messages)
+                    .temperature(0.2)
+                    .maxOutputTokens(maxTokens)
+                    .build();
+
+            ChatResponse response = chatModel.chat(request);
+
+            String content = response.aiMessage().text();
+
+            if (content == null || content.isBlank()) {
                 throw new RuntimeException("Empty response from Groq API");
             }
 
-            JsonNode root = objectMapper.readTree(response.getBody());
+            return content;
 
-            JsonNode contentNode = root
-                    .path("choices")
-                    .path(0)
-                    .path("message")
-                    .path("content");
-
-            if (contentNode.isMissingNode() || contentNode.asText().isBlank()) {
-                throw new RuntimeException("Invalid Groq API response");
-            }
-
-            return contentNode.asText();
-
-        } catch (HttpClientErrorException e) {
-            throw new RuntimeException("Groq API Error: " + e.getResponseBodyAsString());
         } catch (Exception e) {
             throw new RuntimeException("Something went wrong: " + e.getMessage());
         }

@@ -26,17 +26,20 @@ public class TechnicalInterviewService {
     private final TechnicalInterviewAnswerRepository answerRepository;
     private final ChatService chatService;
     private final ObjectMapper objectMapper;
+    private final PdfEmbeddingService pdfEmbeddingService;
 
     public TechnicalInterviewService(
             TechnicalInterviewRepository interviewRepository,
             TechnicalInterviewAnswerRepository answerRepository,
             ChatService chatService,
-            ObjectMapper objectMapper
+            ObjectMapper objectMapper,
+            PdfEmbeddingService pdfEmbeddingService
     ) {
         this.interviewRepository = interviewRepository;
         this.answerRepository = answerRepository;
         this.chatService = chatService;
         this.objectMapper = objectMapper;
+        this.pdfEmbeddingService = pdfEmbeddingService;
     }
 
     // Extract text from uploaded PDF resume
@@ -68,6 +71,44 @@ public class TechnicalInterviewService {
         } catch (Exception e) {
             throw new RuntimeException("Resume extraction failed: " + e.getMessage());
         }
+    }
+
+    // Lightweight resume ingestion for the Agent Chat "attach resume" flow.
+    // Reuses the EXACT SAME PdfEmbeddingService.ingestResume() call that
+    // startInterview() uses below, so chunks end up scoped identically
+    // (same username + interviewId metadata, same ChromaService.addEmbeddings
+    // path) and are retrievable via the normal searchResume/ResumeRagTool flow.
+    //
+    // Deliberately does NOT call chatService.askShort() to generate a 5-question
+    // technical interview set — that's a second, unrelated LLM call the agent
+    // chat flow doesn't need, and it would otherwise fire on every resume
+    // attachment just to produce questions nobody asked for. This still creates
+    // a real TechnicalInterview row (status "AGENT_CHAT") because interviewId
+    // is the scoping key PdfEmbeddingService/ChromaService require — there's no
+    // separate resume-storage table to attach to instead.
+    public Long ingestResumeForAgentSession(String username, String resumeText) {
+        if (resumeText == null || resumeText.isBlank()) {
+            throw new RuntimeException("Resume text cannot be empty");
+        }
+
+        TechnicalInterview interview = new TechnicalInterview();
+        interview.setUsername(username);
+        interview.setResumeText(limitText(resumeText, 5000));
+        interview.setQuestionsJson("[]");
+        interview.setTotalScore(0);
+        interview.setStatus("AGENT_CHAT");
+        interview.setStartedAt(LocalDateTime.now());
+
+        TechnicalInterview saved = interviewRepository.save(interview);
+
+        // Not wrapped in a try/catch-and-continue like startInterview() does —
+        // if ingestion fails here, the whole point of attaching a resume in
+        // chat has failed, so the caller (AgentController) should know and
+        // surface a clear error instead of silently proceeding with an
+        // interviewId whose Chroma chunks were never actually written.
+        pdfEmbeddingService.ingestResume(username, saved.getId(), resumeText);
+
+        return saved.getId();
     }
 
     // Start interview and generate first set of resume-based questions
@@ -135,6 +176,15 @@ public class TechnicalInterviewService {
 
         TechnicalInterview saved = interviewRepository.save(interview);
 
+        try {
+            pdfEmbeddingService.ingestResume(username, saved.getId(), resumeText);
+        } catch (Exception e) {
+            // Don't fail interview creation if embedding/Chroma is temporarily unavailable —
+            // the interview can still proceed using the full resume text as a fallback
+            // (used directly in prompts elsewhere, e.g. completeInterview's final report).
+            System.err.println("Resume ingestion into Chroma failed: " + e.getMessage());
+        }
+
         return Map.of(
                 "interviewId", saved.getId(),
                 "questions", questions,
@@ -163,8 +213,25 @@ public class TechnicalInterviewService {
             throw new RuntimeException("You are not allowed to submit answer for this interview");
         }
 
+        String retrievalQuery = request.getQuestion() + " " + request.getAnswer();
+        List<String> relevantChunks = pdfEmbeddingService.retrieveRelevantChunks(
+                username, interview.getId(), retrievalQuery, 5
+        );
+        String resumeContext = relevantChunks.isEmpty()
+                ? "No relevant resume context found."
+                : String.join("\n---\n", relevantChunks);
+
         String prompt = """
                 Evaluate this technical interview answer.
+                
+                The Resume Context below is background only — it tells you what projects and
+                        technologies the candidate has worked with. It is NOT the answer, and you must
+                        NOT award marks just because a concept, tool, or project appears in it.
+                
+                        Score and evaluate ONLY what the candidate actually wrote in their Candidate Answer.
+                        Use the Resume Context only to:
+                        - Judge whether their answer is consistent with their claimed experience
+                        - Craft a more specific, relevant follow-up question
 
                 Resume Context:
                 %s
@@ -200,7 +267,7 @@ public class TechnicalInterviewService {
                 - Score must be 0/10 to 10/10.
                 - Keep answer concise.
                 """.formatted(
-                limitText(interview.getResumeText(), 2500),
+                resumeContext,
                 request.getQuestion(),
                 limitText(request.getAnswer(), 1200),
                 request.getTopic() == null ? "General Technical" : request.getTopic()
@@ -269,6 +336,17 @@ public class TechnicalInterviewService {
             );
         }
 
+        String retrievalQuery = (previousAnswer != null && !previousAnswer.isBlank())
+                ? previousAnswer
+                : (previousQuestion != null ? previousQuestion : "resume overview");
+
+        List<String> relevantChunks = pdfEmbeddingService.retrieveRelevantChunks(
+                username, interviewId, retrievalQuery, 5
+        );
+        String resumeContext = relevantChunks.isEmpty()
+                ? "No relevant resume context found."
+                : String.join("\n---\n", relevantChunks);
+
         String prompt = """
                 You are a real technical interviewer.
 
@@ -298,6 +376,7 @@ public class TechnicalInterviewService {
                 - Return ONLY valid JSON object.
                 - No markdown.
                 - No explanation.
+                - Prefer follow-up questions if the previous answer was weak or incomplete.
 
                 JSON format:
                 {
@@ -307,7 +386,7 @@ public class TechnicalInterviewService {
                   "difficulty": "Medium"
                 }
                 """.formatted(
-                limitText(interview.getResumeText(), 2500),
+                resumeContext,
                 previousQuestion == null ? "No previous question" : previousQuestion,
                 previousAnswer == null ? "No previous answer" : limitText(previousAnswer, 1200),
                 previousFeedback == null ? "No previous feedback" : limitText(previousFeedback, 1200),
@@ -448,9 +527,9 @@ public class TechnicalInterviewService {
             TechnicalInterviewQuestionDto question =
                     objectMapper.readValue(json, TechnicalInterviewQuestionDto.class);
 
-            if (question.getId() == null) {
-                question.setId(fallbackId);
-            }
+
+            question.setId(fallbackId);
+
 
             if (question.getQuestion() == null || question.getQuestion().isBlank()) {
                 return fallbackNextQuestion(fallbackId);
