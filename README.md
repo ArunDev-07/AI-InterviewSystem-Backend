@@ -27,7 +27,7 @@ An AI agent that reads a candidate's resume, GitHub profile, target job descript
 
 ---
 
-## macOS-Style System Overview
+## System Overview
 
 <div align="center">
 
